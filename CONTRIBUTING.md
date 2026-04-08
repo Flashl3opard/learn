@@ -8,7 +8,7 @@ This document explains how to contribute effectively to this repository. Followi
 
 This project and everyone participating in it is expected to act respectfully and constructively.
 
-If you encounter unacceptable behavior, please report it to [info@alphaonelabs.com](mailto:info@alphaonelabs.com).
+If you encounter unacceptable behavior, please open an issue with the maintainers.
 
 ## Getting Started
 
@@ -194,6 +194,5 @@ By contributing, you agree that your contributions are licensed under the GNU Af
 
 - Open an issue for bugs and feature requests
 - Start a discussion in the PR if you need design direction
-- Reach out via [info@alphaonelabs.com](mailto:info@alphaonelabs.com) for project-level concerns
 
 Thank you for contributing.
