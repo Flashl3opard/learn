@@ -976,13 +976,21 @@ async def api_join(req, env):
     if not act:
         return err("Activity not found", 404)
 
+    existing = await env.DB.prepare(
+        "SELECT id FROM enrollments WHERE activity_id=? AND user_id=?"
+    ).bind(act_id, user["id"]).first()
+    if existing:
+        return ok(None, "Already joined activity")
+
     enr_id = new_id()
     try:
         await env.DB.prepare(
-            "INSERT OR IGNORE INTO enrollments (id,activity_id,user_id,role)"
+            "INSERT INTO enrollments (id,activity_id,user_id,role)"
             " VALUES (?,?,?,?)"
         ).bind(enr_id, act_id, user["id"], role).run()
     except Exception as e:
+        if "UNIQUE" in str(e):
+            return ok(None, "Already joined activity")
         capture_exception(e, req, env, "api_join.insert_enrollment")
         return err("Failed to join activity — please try again", 500)
 
