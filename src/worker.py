@@ -39,28 +39,112 @@ import json
 import os
 import re
 import traceback
+from types import SimpleNamespace
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse, parse_qs
 
-from workers import Response
+from workers import Response, DurableObject
+
+import js
+from pyodide.ffi import to_js
+from js import WebSocketPair, WebSocketRequestResponsePair
+import uuid
+
+_SENTRY_INITIALIZED = False
+_SENTRY_DSN: str = ""
 
 
-def capture_exception(exc: Exception, req=None, _env=None, where: str = ""):
-    """Best-effort exception logging with full traceback and request context."""
+def init_sentry(env):
+    """Cache the Sentry DSN once per worker isolate."""
+    global _SENTRY_INITIALIZED, _SENTRY_DSN
+    if _SENTRY_INITIALIZED:
+        return
+    _SENTRY_INITIALIZED = True
+    _SENTRY_DSN = getattr(env, "SENTRY_DSN", "") or ""
+
+def _redact_url(raw_url: str) -> str:
+    """Remove secrets from URLs before logging or sending to Sentry."""
     try:
-        payload = {
-            "level": "error",
-            "where": where or "unknown",
+        parsed = urlparse(raw_url)
+        query = re.sub(r"([?&](?:token|access_token)=)[^&]+", r"\1[redacted]", "?" + parsed.query)
+        safe_query = query[1:] if parsed.query else ""
+        return parsed._replace(query=safe_query).geturl()
+    except Exception:
+        return "[redacted-url]"
+
+async def _post_to_sentry(exc: Exception, dsn: str, where: str, req=None):
+    """Send an exception to Sentry via the HTTP Store API using js.fetch."""
+    try:
+        parsed     = urlparse(dsn)
+        public_key = parsed.username
+        host       = parsed.hostname
+        project_id = parsed.path.strip("/")
+        endpoint   = f"https://{host}/api/{project_id}/store/"
+
+        tb_frames = []
+        if exc.__traceback__:
+            for fi in traceback.extract_tb(exc.__traceback__):
+                tb_frames.append({
+                    "filename":     fi.filename,
+                    "function":     fi.name,
+                    "lineno":       fi.lineno,
+                    "context_line": fi.line or "",
+                })
+
+        event: Dict[str, Any] = {
+            "event_id":  os.urandom(16).hex(),
+            "level":     "error",
+            "logger":    where or "worker",
+            "tags":      {"where": where or "unknown"},
+            "exception": {
+                "values": [{
+                    "type":       type(exc).__name__,
+                    "value":      str(exc),
+                    "stacktrace": {"frames": tb_frames},
+                }]
+            },
+        }
+        if req:
+            event["request"] = {"url": _redact_url(req.url), "method": req.method}
+
+        auth = (
+            f"Sentry sentry_version=7, sentry_key={public_key},"
+            f" sentry_client=cf-worker/1.0"
+        )
+        options = to_js(
+            {
+                "method":  "POST",
+                "headers": {"Content-Type": "application/json", "X-Sentry-Auth": auth},
+                "body":    json.dumps(event),
+            },
+            dict_converter=js.Object.fromEntries,
+        )
+        await js.fetch(endpoint, options)
+    except Exception as post_exc:
+        print(json.dumps({"level": "warn", "where": "sentry_http_post", "error": str(post_exc)}))
+
+
+async def capture_exception(exc: Exception, req=None, _env=None, where: str = ""):
+    """Best-effort exception logging via print + Sentry HTTP Store API."""
+    try:
+        payload: Dict[str, Any] = {
+            "level":      "error",
+            "where":      where or "unknown",
             "error_type": type(exc).__name__,
-            "error": str(exc),
-            "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            "error":      str(exc),
+            "traceback":  "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
         }
         if req:
             payload["request"] = {
                 "method": req.method,
-                "url": req.url,
-                "path": urlparse(req.url).path,
+                "url":    _redact_url(req.url),
+                "path":   urlparse(req.url).path,
             }
         print(json.dumps(payload))
+
+        dsn = _SENTRY_DSN or (getattr(_env, "SENTRY_DSN", "") if _env else "")
+        if dsn:
+            await _post_to_sentry(exc, dsn, where, req)
     except Exception:
         pass
 
@@ -79,18 +163,8 @@ def new_id() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Encryption helpers
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Encryption helpers - AES-256-GCM via Web Crypto API (js.crypto.subtle)
 # ---------------------------------------------------------------------------
-# Replaces the XOR stream cipher with authenticated AES-256-GCM encryption.
-# - 256-bit key derived from secret via PBKDF2-SHA256 (100k iterations)
-# - 96-bit random IV prepended to ciphertext
-# - 128-bit GCM auth tag appended automatically by Web Crypto
-# - Output: base64(iv || ciphertext+tag) prefixed with "v1:" for D1 storage
-# - Backward compatible: no "v1:" prefix = legacy XOR, decrypted transparently
 
 def _derive_key(secret: str) -> bytes:
     """Derive a 32-byte key from an arbitrary secret string via SHA-256."""
@@ -109,11 +183,9 @@ def _derive_aes_key_bytes(secret: str) -> bytes:
 
 async def _import_aes_key(key_bytes: bytes) -> object:
     """Import raw bytes as a Web Crypto AES-GCM CryptoKey."""
-    import js
-    from pyodide.ffi import to_js
     key_buf = to_js(key_bytes, create_pyproxies=False)
-    algo    = to_js({"name": "AES-GCM"}, create_pyproxies=False)
-    usages  = to_js(["encrypt", "decrypt"], create_pyproxies=False)
+    algo    = to_js({"name": "AES-GCM"}, dict_converter=js.Object.fromEntries)
+    usages  = to_js(["encrypt", "decrypt"])
     return await js.crypto.subtle.importKey("raw", key_buf, algo, False, usages)
 
 
@@ -126,18 +198,21 @@ async def encrypt_aes(plaintext: str, secret: str) -> str:
     if not plaintext:
         return ""
     try:
-        import js
-        from pyodide.ffi import to_js
         key_bytes  = _derive_aes_key_bytes(secret)
         crypto_key = await _import_aes_key(key_bytes)
-        iv         = bytes(js.crypto.getRandomValues(to_js(bytearray(12))))
-        algo       = to_js({"name": "AES-GCM", "iv": to_js(iv)}, create_pyproxies=False)
+
+        iv_array   = js.Uint8Array.new(12)
+        js.crypto.getRandomValues(iv_array)
+        iv         = bytes(iv_array)
+
+        # Pass algo as a plain dict; Web Crypto accepts both JS objects and plain dicts
+        algo       = to_js({"name": "AES-GCM", "iv": iv_array}, dict_converter=js.Object.fromEntries)
         data       = to_js(plaintext.encode("utf-8"), create_pyproxies=False)
         ct_buf     = await js.crypto.subtle.encrypt(algo, crypto_key, data)
         ct         = bytes(js.Uint8Array.new(ct_buf))
         return "v1:" + base64.b64encode(iv + ct).decode("ascii")
     except Exception as exc:
-        capture_exception(exc, where="encrypt_aes")
+        await capture_exception(exc, where="encrypt_aes")
         raise RuntimeError(f"AES-256-GCM encryption failed: {exc}") from exc
 
 
@@ -149,24 +224,22 @@ async def decrypt_aes(ciphertext: str, secret: str) -> str:
         return ""
     if not ciphertext.startswith("v1:"):
         return _decrypt_xor(ciphertext, secret)
-    import js
-    from pyodide.ffi import to_js
     try:
         raw        = base64.b64decode(ciphertext[3:])
         iv, ct     = raw[:12], raw[12:]
     except Exception as exc:
-        capture_exception(exc, where="decrypt_aes.decode")
+        await capture_exception(exc, where="decrypt_aes.decode")
         return "[decryption error]"
-    key_bytes  = _derive_aes_key_bytes(secret)
-    crypto_key = await _import_aes_key(key_bytes)
-    algo       = to_js({"name": "AES-GCM", "iv": to_js(iv)}, create_pyproxies=False)
-    data       = to_js(ct, create_pyproxies=False)
     try:
-        pt_buf = await js.crypto.subtle.decrypt(algo, crypto_key, data)
+        key_bytes  = _derive_aes_key_bytes(secret)
+        crypto_key = await _import_aes_key(key_bytes)
+        iv_array   = to_js(iv, create_pyproxies=False)
+        algo       = to_js({"name": "AES-GCM", "iv": iv_array}, dict_converter=js.Object.fromEntries)
+        data       = to_js(ct, create_pyproxies=False)
+        pt_buf     = await js.crypto.subtle.decrypt(algo, crypto_key, data)
         return bytes(js.Uint8Array.new(pt_buf)).decode("utf-8")
     except Exception as exc:
-        # Auth tag mismatch = tampered/corrupted ciphertext
-        capture_exception(exc, where="decrypt_aes.auth")
+        await capture_exception(exc, where="decrypt_aes.auth")
         return "[decryption error]"
 
 
@@ -450,12 +523,44 @@ _DDL = [
     "CREATE INDEX IF NOT EXISTS idx_sa_session           ON session_attendance(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_sa_user              ON session_attendance(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_at_activity          ON activity_tags(activity_id)",
+    # Notifications
+    """CREATE TABLE IF NOT EXISTS notifications (
+        id         TEXT PRIMARY KEY,
+        user_id    TEXT NOT NULL,
+        type       TEXT NOT NULL,
+        title      TEXT NOT NULL,
+        message    TEXT NOT NULL,
+        is_read    INTEGER NOT NULL DEFAULT 0,
+        related_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_notif_user   ON notifications(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_notif_unread  ON notifications(user_id, is_read)",
+    "CREATE INDEX IF NOT EXISTS idx_notif_created ON notifications(user_id, created_at DESC)",
+
 ]
 
 
 async def init_db(env):
     for sql in _DDL:
         await env.DB.prepare(sql).run()
+
+
+_NO_SUCH_TABLE_RE = re.compile(r"\bno such table\b", re.IGNORECASE)
+
+
+def _is_no_such_table_error(exc: Exception) -> bool:
+    """Return True when an exception chain indicates a SQLite/D1 missing-table error."""
+    if _NO_SUCH_TABLE_RE.search(str(exc) or ""):
+        return True
+    cause = getattr(exc, "__cause__", None)
+    return bool(cause and _NO_SUCH_TABLE_RE.search(str(cause) or ""))
+
+
+def _empty_d1_result():
+    """Return a minimal D1-style result object with an empty `results` collection."""
+    return SimpleNamespace(results=[])
 
 
 # ---------------------------------------------------------------------------
@@ -490,14 +595,13 @@ async def seed_db(env, enc_key: str):
                 await encrypt_aes(role,     enc_key),
             ).run()
         except Exception:
-            pass  # already seeded
+            pass
 
     aid = uid_map["alice"]
     bid = uid_map["bob"]
     cid = uid_map["charlie"]
     did = uid_map["diana"]
 
-    # ---- tags ----------------------------------------------------------------
     tag_rows = [
         ("tag-python", "Python"),
         ("tag-js",     "JavaScript"),
@@ -515,7 +619,6 @@ async def seed_db(env, enc_key: str):
         except Exception:
             pass
 
-    # ---- activities ----------------------------------------------------------
     act_rows = [
         (
             "act-py-begin", "Python for Beginners",
@@ -581,7 +684,6 @@ async def seed_db(env, enc_key: str):
             except Exception:
                 pass
 
-    # ---- sessions for live/recurring activities ------------------------------
     ses_rows = [
         ("ses-js-1", "act-js-meetup",
          "April Meetup", "Q1 retro and React 19 deep-dive",
@@ -617,7 +719,6 @@ async def seed_db(env, enc_key: str):
         except Exception:
             pass
 
-    # ---- enrollments ---------------------------------------------------------
     enr_rows = [
         ("enr-c-py",     "act-py-begin",    cid, "participant"),
         ("enr-c-js",     "act-js-meetup",   cid, "participant"),
@@ -677,7 +778,7 @@ async def api_register(req, env):
     except Exception as e:
         if "UNIQUE" in str(e):
             return err("Username or email already registered", 409)
-        capture_exception(e, req, env, "api_register.insert_user")
+        await capture_exception(e, req, env, "api_register.insert_user")
         return err("Registration failed — please try again", 500)
 
     token = create_token(uid, username, role, env.JWT_SECRET)
@@ -707,7 +808,7 @@ async def api_login(req, env):
 
     if not row:
         return err("Invalid username or password", 401)
-    
+
     password_hash = row.password_hash
     user_id = row.id
     role_enc = row.role
@@ -751,33 +852,41 @@ async def api_list_activities(req, env):
         " FROM activities a JOIN users u ON a.host_id=u.id"
     )
 
-    if tag:
-        tag_row = await env.DB.prepare(
-            "SELECT id FROM tags WHERE name=?"
-        ).bind(tag).first()
-        if not tag_row:
-            return json_resp({"activities": []})
-        res = await env.DB.prepare(
-            base_q
-            + " JOIN activity_tags at2 ON at2.activity_id=a.id"
-              " WHERE at2.tag_id=? ORDER BY a.created_at DESC"
-        ).bind(tag_row.id).all()
-    elif atype and fmt:
-        res = await env.DB.prepare(
-            base_q + " WHERE a.type=? AND a.format=? ORDER BY a.created_at DESC"
-        ).bind(atype, fmt).all()
-    elif atype:
-        res = await env.DB.prepare(
-            base_q + " WHERE a.type=? ORDER BY a.created_at DESC"
-        ).bind(atype).all()
-    elif fmt:
-        res = await env.DB.prepare(
-            base_q + " WHERE a.format=? ORDER BY a.created_at DESC"
-        ).bind(fmt).all()
-    else:
-        res = await env.DB.prepare(
+    async def fetch_activities():
+        if tag:
+            tag_row = await env.DB.prepare(
+                "SELECT id FROM tags WHERE name=?"
+            ).bind(tag).first()
+            if not tag_row:
+                return _empty_d1_result()
+            return await env.DB.prepare(
+                base_q
+                + " JOIN activity_tags at2 ON at2.activity_id=a.id"
+                  " WHERE at2.tag_id=? ORDER BY a.created_at DESC"
+            ).bind(tag_row.id).all()
+        if atype and fmt:
+            return await env.DB.prepare(
+                base_q + " WHERE a.type=? AND a.format=? ORDER BY a.created_at DESC"
+            ).bind(atype, fmt).all()
+        if atype:
+            return await env.DB.prepare(
+                base_q + " WHERE a.type=? ORDER BY a.created_at DESC"
+            ).bind(atype).all()
+        if fmt:
+            return await env.DB.prepare(
+                base_q + " WHERE a.format=? ORDER BY a.created_at DESC"
+            ).bind(fmt).all()
+        return await env.DB.prepare(
             base_q + " ORDER BY a.created_at DESC"
         ).all()
+
+    try:
+        res = await fetch_activities()
+    except Exception as e:
+        if not _is_no_such_table_error(e):
+            raise
+        await init_db(env)
+        res = await fetch_activities()
 
     activities = []
     for row in res.results or []:
@@ -849,7 +958,7 @@ async def api_create_activity(req, env):
             atype, fmt, schedule_type, user["id"]
         ).run()
     except Exception as e:
-        capture_exception(e, req, env, "api_create_activity.insert_activity")
+        await capture_exception(e, req, env, "api_create_activity.insert_activity")
         return err("Failed to create activity — please try again", 500)
 
     for tag_name in (body.get("tags") or []):
@@ -868,14 +977,14 @@ async def api_create_activity(req, env):
                     "INSERT INTO tags (id,name) VALUES (?,?)"
                 ).bind(tag_id, tag_name).run()
             except Exception as e:
-                capture_exception(e, req, env, f"api_create_activity.insert_tag: tag_name={tag_name}, tag_id={tag_id}, act_id={act_id}")
+                await capture_exception(e, req, env, f"api_create_activity.insert_tag: tag_name={tag_name}, tag_id={tag_id}, act_id={act_id}")
                 continue
         try:
             await env.DB.prepare(
                 "INSERT OR IGNORE INTO activity_tags (activity_id,tag_id) VALUES (?,?)"
             ).bind(act_id, tag_id).run()
         except Exception as e:
-            capture_exception(e, req, env, f"api_create_activity.insert_activity_tags: tag_name={tag_name}, tag_id={tag_id}, act_id={act_id}")
+            await capture_exception(e, req, env, f"api_create_activity.insert_activity_tags: tag_name={tag_name}, tag_id={tag_id}, act_id={act_id}")
             pass
 
     return ok({"id": act_id, "title": title}, "Activity created")
@@ -983,7 +1092,7 @@ async def api_join(req, env):
             " VALUES (?,?,?,?)"
         ).bind(enr_id, act_id, user["id"], role).run()
     except Exception as e:
-        capture_exception(e, req, env, "api_join.insert_enrollment")
+        await capture_exception(e, req, env, "api_join.insert_enrollment")
         return err("Failed to join activity — please try again", 500)
 
     return ok(None, "Joined activity successfully")
@@ -1093,7 +1202,7 @@ async def api_create_session(req, env):
             await encrypt_aes(location, enc) if location else "",
         ).run()
     except Exception as e:
-        capture_exception(e, req, env, "api_create_session.insert_session")
+        await capture_exception(e, req, env, "api_create_session.insert_session")
         return err("Failed to create session — please try again", 500)
 
     return ok({"id": sid}, "Session created")
@@ -1142,14 +1251,14 @@ async def api_add_activity_tags(req, env):
                     "INSERT INTO tags (id,name) VALUES (?,?)"
                 ).bind(tag_id, tag_name).run()
             except Exception as e:
-                capture_exception(e, req, env, f"api_add_activity_tags.insert_tag: tag_name={tag_name}, tag_id={tag_id}, act_id={act_id}")
+                await capture_exception(e, req, env, f"api_add_activity_tags.insert_tag: tag_name={tag_name}, tag_id={tag_id}, act_id={act_id}")
                 continue
         try:
             await env.DB.prepare(
                 "INSERT OR IGNORE INTO activity_tags (activity_id,tag_id) VALUES (?,?)"
             ).bind(act_id, tag_id).run()
         except Exception as e:
-            capture_exception(e, req, env, f"api_add_activity_tags.insert_activity_tags: tag_name={tag_name}, tag_id={tag_id}, act_id={act_id}")
+            await capture_exception(e, req, env, f"api_add_activity_tags.insert_activity_tags: tag_name={tag_name}, tag_id={tag_id}, act_id={act_id}")
             pass
 
     return ok(None, "Tags updated")
@@ -1159,18 +1268,27 @@ async def api_admin_table_counts(req, env):
     if not _is_basic_auth_valid(req, env):
         return _unauthorized_basic()
 
-    tables_res = await env.DB.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-    ).all()
+    async def fetch_counts():
+        tables_res = await env.DB.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).all()
 
-    counts = []
-    for row in tables_res.results or []:
-        table_name = row.name
-        # Table names come from sqlite_master and are quoted to avoid SQL injection.
-        count_row = await env.DB.prepare(
-            f'SELECT COUNT(*) AS cnt FROM "{table_name.replace(chr(34), chr(34) + chr(34))}"'
-        ).first()
-        counts.append({"table": table_name, "count": count_row.cnt if count_row else 0})
+        counts = []
+        for row in tables_res.results or []:
+            table_name = row.name
+            count_row = await env.DB.prepare(
+                f'SELECT COUNT(*) AS cnt FROM "{table_name.replace(chr(34), chr(34) + chr(34))}"'
+            ).first()
+            counts.append({"table": table_name, "count": count_row.cnt if count_row else 0})
+        return counts
+
+    try:
+        counts = await fetch_counts()
+    except Exception as e:
+        if not _is_no_such_table_error(e):
+            raise
+        await init_db(env)
+        counts = await fetch_counts()
 
     return json_resp({"tables": counts})
 
@@ -1221,6 +1339,686 @@ async def serve_static(path: str, env):
     mime = _MIME.get(ext, "text/plain")
     return Response(content, headers={"Content-Type": mime, **_CORS})
 
+class ClassroomDO(DurableObject):
+    """WebSocket based virtual classroom Durable Object.
+
+    Each room_id maps to one DO instance.  Connected clients share:
+      - room_state   (participant list, broadcast on join/leave)
+      - position_update (x/y movement relay)
+      - chat_message  (basic text relay)
+      - seat mgmt     (update_seat / leave_seat)
+    """
+
+    def __init__(self, ctx, env):
+        super().__init__(ctx, env)
+        # sessions: session_id -> {ws, participant_id, display_name, position, direction, is_moving, seat_id}
+        self.sessions = {}
+
+        # Restore hibernated WebSocket connections
+        for ws in self.ctx.getWebSockets():
+            try:
+                attachment = ws.deserializeAttachment()
+                if not attachment:
+                    continue
+                data = json.loads(attachment) if isinstance(attachment, str) else attachment
+                sid = data.get("session_id", str(uuid.uuid4()))
+                self.sessions[sid] = {
+                    "ws":             ws,
+                    "participant_id": data.get("participant_id", "unknown"),
+                    "display_name":   data.get("display_name", "Unknown"),
+                    "position":       data.get("position", {"x": 0.5, "y": 0.5}),
+                    "direction":      data.get("direction", "down"),
+                    "is_moving":      False,
+                    "seat_id":        data.get("seat_id", ""),
+                }
+            except Exception as exc:
+                print(f"[ClassroomDO.__init__.restore] error={exc!r}")
+
+        self.ctx.setWebSocketAutoResponse(
+            WebSocketRequestResponsePair.new("ping", "pong")
+        )
+
+    async def on_fetch(self, request):
+        upgrade = request.headers.get("Upgrade") or ""
+        if upgrade.lower() != "websocket":
+            return Response(
+                json.dumps({"error": "Expected WebSocket upgrade"}),
+                status=426,
+                headers={"Content-Type": "application/json"},
+            )
+
+        parsed = urlparse(request.url)
+        qs = parse_qs(parsed.query)
+
+        token_param = (qs.get("token") or [None])[0]
+        participant_param = (qs.get("participant_id") or [None])[0]
+        display_name_param = (qs.get("display_name") or [None])[0]
+
+        authenticated_user = verify_token(token_param or "", self.env.JWT_SECRET) if token_param else None
+        allow_anonymous_poc = (
+            str(getattr(self.env, "ALLOW_ANON_CLASSROOM_POC", "")).lower()
+            in {"1", "true", "yes"}
+        )
+
+        if authenticated_user:
+            # Derive identity from the verified token, not from untrusted query params.
+            participant_id = authenticated_user["id"]
+            display_name = authenticated_user.get("username") or participant_id
+        else:
+            # Allow anonymous POC joins only when explicitly enabled.
+            if token_param or not allow_anonymous_poc or not participant_param:
+                return Response(
+                    json.dumps({"error": "Authentication required"}),
+                    status=401,
+                    headers={"Content-Type": "application/json"},
+                )
+            participant_id = participant_param
+            display_name = display_name_param or participant_id
+
+        # Sanitise inputs
+        participant_id = participant_id[:64]
+        display_name   = display_name[:64]
+
+        # Create WebSocket pair
+        client, server = WebSocketPair.new().object_values()
+        self.ctx.acceptWebSocket(server)
+
+        session_id = str(uuid.uuid4())
+
+        # Re-use the last known position/seat if the same participant reconnects
+        # (e.g. page refresh or network blip).
+        existing = next(
+            (s for s in self.sessions.values()
+             if s["participant_id"] == participant_id),
+            None,
+        )
+        already_connected = existing is not None
+        initial_position  = dict(existing["position"])       if existing else {"x": 0.5, "y": 0.5}
+        initial_direction = existing["direction"]             if existing else "down"
+        initial_seat_id   = existing.get("seat_id", "")      if existing else ""
+
+        attachment = json.dumps({
+            "session_id":     session_id,
+            "participant_id": participant_id,
+            "display_name":   display_name,
+            "position":       initial_position,
+            "direction":      initial_direction,
+            "seat_id":        initial_seat_id,
+        })
+        server.serializeAttachment(attachment)
+
+        self.sessions[session_id] = {
+            "ws":             server,
+            "participant_id": participant_id,
+            "display_name":   display_name,
+            "position":       initial_position,
+            "direction":      initial_direction,
+            "is_moving":      False,
+            "seat_id":        initial_seat_id,
+        }
+
+        try:
+            server.send(json.dumps({
+                "type":           "user_info",
+                "session_id":     session_id,
+                "participant_id": participant_id,
+                "display_name":   display_name,
+            }))
+        except Exception as exc:
+            await capture_exception(exc, request, self.env, "classroom_on_fetch.send_user_info")
+
+        self._broadcast_room_state()
+
+        if not already_connected:
+            self._broadcast(json.dumps({
+                "type":           "participant_joined",
+                "participant_id": participant_id,
+                "display_name":   display_name,
+            }), exclude_session_id=session_id)
+
+        return Response(None, status=101, web_socket=client)
+
+    async def on_webSocketMessage(self, ws, message):
+        try:
+            raw_message = message if isinstance(message, str) else message.decode("utf-8")
+            if len(raw_message) > 4096:
+                return
+            data = json.loads(raw_message)
+        except Exception as exc:
+            await capture_exception(exc, None, self.env, "classroom_on_webSocketMessage.parse")
+            return
+        if not isinstance(data, dict):
+            return
+
+        msg_type = data.get("type", "")
+        session  = self._session_for_ws(ws)
+        if not session:
+            return
+
+        sid, info = session
+
+        def _valid_norm_position(value):
+            """Accept normalized (0-1) position dicts; reject anything else."""
+            if not isinstance(value, dict):
+                return None
+            try:
+                x = float(value.get("x", 0.5))
+                y = float(value.get("y", 0.5))
+            except (TypeError, ValueError):
+                return None
+            # Clamp to [0, 1] — normalized coordinate space
+            return {"x": max(0.0, min(1.0, x)), "y": max(0.0, min(1.0, y))}
+
+        if msg_type == "position_update":
+            position = _valid_norm_position(data.get("position"))
+            if position is None:
+                return
+            direction = data.get("direction", info["direction"])
+            if not isinstance(direction, str) or direction not in {"up", "down", "left", "right"}:
+                direction = info["direction"]
+            is_moving = data.get("isMoving", False)
+            if not isinstance(is_moving, bool):
+                is_moving = False
+            info["position"]  = position
+            info["direction"] = direction
+            info["is_moving"] = is_moving
+            for s_id, s_info in self.sessions.items():
+                if s_info["participant_id"] == info["participant_id"]:
+                    s_info["position"]  = position
+                    s_info["direction"] = direction
+                    s_info["is_moving"] = info["is_moving"]
+                    self._persist_attachment(s_id, s_info)
+
+            self._broadcast(json.dumps({
+                "type":           "position_update",
+                "participant_id": info["participant_id"],
+                "display_name":   info["display_name"],
+                "position":       info["position"],
+                "direction":      info["direction"],
+                "isMoving":       info["is_moving"],
+            }), exclude_session_id=sid)
+
+        elif msg_type == "chat_message":
+            raw_text = data.get("text", "")
+            if not isinstance(raw_text, str):
+                return
+            text = raw_text.strip()[:500]
+            if not text:
+                return
+            raw_timestamp = data.get("timestamp", "")
+            timestamp = raw_timestamp[:64] if isinstance(raw_timestamp, str) else ""
+            self._broadcast(json.dumps({
+                "type":           "chat_message",
+                "participant_id": info["participant_id"],
+                "display_name":   info["display_name"],
+                "text":           text,
+                "timestamp":      timestamp,
+            }))
+
+        
+        elif msg_type == "update_seat":
+            # Classroom layout, keep in sync with DESK_ROWS/DESK_COLS in classroom_poc.html
+            DESK_ROWS = 3
+            DESK_COLS = 5
+            MAX_SEATS = DESK_ROWS * DESK_COLS
+
+            seat_id = data.get("seat_id", "")
+            # Validate seat_id: must be "seat-N" where N is 1..DESK_ROWS*DESK_COLS
+            if not isinstance(seat_id, str) or not re.fullmatch(r"seat-\d+", seat_id):
+                return
+            seat_num = int(seat_id.split("-", 1)[1])
+            if not (1 <= seat_num <= MAX_SEATS):
+                return
+
+            for other_info in self.sessions.values():
+                if (other_info["seat_id"] == seat_id
+                        and other_info["participant_id"] != info["participant_id"]):
+                    try:
+                        ws.send(json.dumps({
+                            "type":    "seat_occupied",
+                            "message": "This seat is already taken by another student.",
+                            "seat_id": seat_id,
+                        }))
+                    except Exception as exc:
+                        await capture_exception(exc, None, self.env,
+                            f"classroom.seat_occupied_send pid={info['participant_id']} seat={seat_id}")
+                    return
+
+            for s_id, s_info in self.sessions.items():
+                if s_info["participant_id"] == info["participant_id"]:
+                    s_info["seat_id"] = seat_id
+                    self._persist_attachment(s_id, s_info)
+
+            self._broadcast(json.dumps({
+                "type":           "seat_updated",
+                "participant_id": info["participant_id"],
+                "display_name":   info["display_name"],
+                "seat_id":        seat_id,
+            }))
+            self._broadcast_room_state()
+
+        elif msg_type == "leave_seat":
+            old_seat = info["seat_id"]
+            if not old_seat:
+                return
+            for s_id, s_info in self.sessions.items():
+                if s_info["participant_id"] == info["participant_id"]:
+                    s_info["seat_id"] = ""
+                    self._persist_attachment(s_id, s_info)
+
+            self._broadcast(json.dumps({
+                "type":           "seat_left",
+                "participant_id": info["participant_id"],
+                "display_name":   info["display_name"],
+                "seat_id":        old_seat,
+            }))
+            self._broadcast_room_state()
+
+    async def on_webSocketClose(self, ws, code, reason, wasClean):
+        session = self._session_for_ws(ws)
+        if not session:
+            return
+
+        sid, info  = session
+        pid        = info["participant_id"]
+        dname      = info["display_name"]
+
+        self.sessions.pop(sid, None)
+
+        still_connected = any(
+            s["participant_id"] == pid for s in self.sessions.values()
+        )
+
+        if not still_connected:
+            self._broadcast(json.dumps({
+                "type":           "participant_left",
+                "participant_id": pid,
+                "display_name":   dname,
+            }))
+
+        self._broadcast_room_state()
+
+    async def on_webSocketError(self, ws, error):
+        # Log for visibility; the runtime will invoke on_webSocketClose separately
+        # which performs the actual session cleanup and broadcasts.
+        print(f"[ClassroomDO.on_webSocketError] error={error!r}")
+
+    # HELPERS:
+
+    def _session_for_ws(self, ws):
+        try:
+            raw = ws.deserializeAttachment()
+            if raw:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                sid  = data.get("session_id", "")
+                if sid and sid in self.sessions:
+                    return (sid, self.sessions[sid])
+        except Exception as exc:
+            print(f"[ClassroomDO._session_for_ws.deserialize] error={exc!r}")
+
+        for sid, info in self.sessions.items():
+            try:
+                if info["ws"] == ws:
+                    return (sid, info)
+            except Exception as exc:
+                print(f"[ClassroomDO._session_for_ws.fallback] sid={sid} error={exc!r}")
+        return None
+
+    def _broadcast(self, msg, exclude_session_id=None):
+        for sid, info in self.sessions.items():
+            if sid == exclude_session_id:
+                continue
+            try:
+                info["ws"].send(msg)
+            except Exception as exc:
+                print(f"[ClassroomDO._broadcast] sid={sid} pid={info.get('participant_id')} error={exc!r}")
+                # Do not pop here - rely on on_webSocketClose to run the full
+                # cleanup + participant_left broadcast. Transient send errors
+                # shouldn't silently evict a session.
+
+    def _broadcast_room_state(self):
+        seen = {}
+        for info in self.sessions.values():
+            pid = info["participant_id"]
+            if pid not in seen:
+                seen[pid] = {
+                    "participant_id": pid,
+                    "display_name":   info["display_name"],
+                    "position":       info["position"],
+                    "direction":      info["direction"],
+                    "is_moving":      info.get("is_moving", False),
+                    "seat_id":        info.get("seat_id", ""),
+                }
+
+        self._broadcast(json.dumps({
+            "type":         "room_state",
+            "participants": list(seen.values()),
+            "count":        len(seen),
+        }))
+
+    def _persist_attachment(self, session_id, info):
+        ws = self.sessions.get(session_id, {}).get("ws")
+        if not ws:
+            return
+        try:
+            ws.serializeAttachment(json.dumps({
+                "session_id":     session_id,
+                "participant_id": info["participant_id"],
+                "display_name":   info["display_name"],
+                "position":       info["position"],
+                "direction":      info["direction"],
+                "seat_id":        info.get("seat_id", ""),
+            }))
+        except Exception as exc:
+            print(f"[ClassroomDO._persist_attachment] sid={session_id} pid={info.get('participant_id')} error={exc!r}")
+
+
+class PresenceDO(DurableObject):
+    """Room-scoped real-time user presence Durable Object."""
+
+    def __init__(self, ctx, env):
+        super().__init__(ctx, env)
+        # session_id -> {ws, user_id, display_name}
+        self.sessions = {}
+        # user_id -> {x, y, emoji, hand_raised, display_name}
+        self.presence = {}
+
+        for ws in self.ctx.getWebSockets():
+            try:
+                attachment = ws.deserializeAttachment()
+                if not attachment:
+                    continue
+                data = json.loads(attachment) if isinstance(attachment, str) else attachment
+                session_id = data.get("session_id", str(uuid.uuid4()))
+                user_id = str(data.get("user_id", ""))[:64]
+                display_name = str(data.get("display_name", user_id or "Unknown"))[:64]
+                if not user_id:
+                    continue
+
+                self.sessions[session_id] = {
+                    "ws": ws,
+                    "user_id": user_id,
+                    "display_name": display_name,
+                }
+                if user_id not in self.presence:
+                    self.presence[user_id] = {
+                        "x": self._clamp_01(data.get("x", 0.5)),
+                        "y": self._clamp_01(data.get("y", 0.5)),
+                        "emoji": data.get("emoji", "") if isinstance(data.get("emoji", ""), str) else "",
+                        "hand_raised": data.get("hand_raised", False) is True,
+                        "display_name": display_name,
+                    }
+            except Exception as exc:
+                print(f"[PresenceDO.__init__.restore] error={exc!r}")
+
+        self.ctx.setWebSocketAutoResponse(
+            WebSocketRequestResponsePair.new("ping", "pong")
+        )
+
+    async def on_fetch(self, request):
+        upgrade = request.headers.get("Upgrade") or ""
+        if upgrade.lower() != "websocket":
+            return Response(
+                json.dumps({"error": "Expected WebSocket upgrade"}),
+                status=426,
+                headers={"Content-Type": "application/json"},
+            )
+
+        parsed = urlparse(request.url)
+        qs = parse_qs(parsed.query)
+        token_param = (qs.get("token") or [None])[0]
+        user_param = (qs.get("user_id") or [None])[0]
+        display_param = (qs.get("display_name") or [None])[0]
+
+        allow_presence_setting = getattr(self.env, "ALLOW_ANON_PRESENCE", None)
+        if allow_presence_setting is None:
+            allow_presence_setting = getattr(self.env, "ALLOW_ANON_CLASSROOM_POC", "")
+        allow_anonymous = str(allow_presence_setting).lower() in {"1", "true", "yes"}
+        authenticated_user = verify_token(token_param or "", self.env.JWT_SECRET) if token_param else None
+
+        if authenticated_user:
+            user_id = str(authenticated_user.get("id", ""))
+            display_name = str(authenticated_user.get("username") or user_id)
+        else:
+            if token_param or not allow_anonymous or not user_param:
+                return Response(
+                    json.dumps({"error": "Authentication required"}),
+                    status=401,
+                    headers={"Content-Type": "application/json"},
+                )
+            user_id = str(user_param)
+            display_name = str(display_param or user_id)
+
+        user_id = user_id[:64]
+        display_name = display_name[:64]
+        if not user_id:
+            return Response(
+                json.dumps({"error": "Invalid user_id"}),
+                status=400,
+                headers={"Content-Type": "application/json"},
+            )
+
+        client, server = WebSocketPair.new().object_values()
+        self.ctx.acceptWebSocket(server)
+
+        session_id = str(uuid.uuid4())
+        existing = self.presence.get(user_id)
+        if existing is None:
+            existing = {
+                "x": 0.5,
+                "y": 0.5,
+                "emoji": "",
+                "hand_raised": False,
+                "display_name": display_name,
+            }
+            self.presence[user_id] = dict(existing)
+        else:
+            existing["display_name"] = display_name
+            self.presence[user_id] = existing
+
+        attachment = json.dumps({
+            "session_id": session_id,
+            "user_id": user_id,
+            "display_name": display_name,
+            "x": existing["x"],
+            "y": existing["y"],
+            "emoji": existing["emoji"],
+            "hand_raised": existing["hand_raised"],
+        })
+        server.serializeAttachment(attachment)
+
+        self.sessions[session_id] = {
+            "ws": server,
+            "user_id": user_id,
+            "display_name": display_name,
+        }
+
+        self._send_welcome(server, session_id, user_id)
+        self._broadcast(
+            json.dumps({
+                "type": "delta",
+                "user_id": user_id,
+                "display_name": display_name,
+                "x": existing["x"],
+                "y": existing["y"],
+                "emoji": existing["emoji"],
+                "hand_raised": existing["hand_raised"],
+            }),
+            exclude_session_id=session_id,
+        )
+
+        return Response(None, status=101, web_socket=client)
+
+    async def on_webSocketMessage(self, ws, message):
+        try:
+            raw = message if isinstance(message, str) else message.decode("utf-8")
+            if len(raw) > 512:
+                print("[PresenceDO.on_webSocketMessage] dropped oversized payload")
+                return
+            data = json.loads(raw)
+        except Exception as exc:
+            await capture_exception(exc, None, self.env, "presence_on_webSocketMessage.parse")
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        session = self._session_for_ws(ws)
+        if not session:
+            return
+        sid, info = session
+        user_id = info["user_id"]
+        current = self.presence.get(user_id)
+        if current is None:
+            current = {
+                "x": 0.5,
+                "y": 0.5,
+                "emoji": "",
+                "hand_raised": False,
+                "display_name": info["display_name"],
+            }
+            self.presence[user_id] = current
+
+        msg_type = data.get("type", "")
+        if msg_type == "join":
+            self._send_welcome(ws, sid, user_id)
+            return
+
+        if msg_type != "presence":
+            return
+
+        delta = {"type": "delta", "user_id": user_id}
+        changed = False
+
+        if "x" in data:
+            next_x = self._clamp_01(data.get("x"))
+            if next_x != current["x"]:
+                current["x"] = next_x
+                delta["x"] = next_x
+                changed = True
+
+        if "y" in data:
+            next_y = self._clamp_01(data.get("y"))
+            if next_y != current["y"]:
+                current["y"] = next_y
+                delta["y"] = next_y
+                changed = True
+
+        if "emoji" in data and isinstance(data.get("emoji"), str):
+            next_emoji = data.get("emoji", "")[:32]
+            if next_emoji != current["emoji"]:
+                current["emoji"] = next_emoji
+                delta["emoji"] = next_emoji
+                changed = True
+
+        if "hand_raised" in data and isinstance(data.get("hand_raised"), bool):
+            next_hand = data.get("hand_raised")
+            if next_hand != current["hand_raised"]:
+                current["hand_raised"] = next_hand
+                delta["hand_raised"] = next_hand
+                changed = True
+
+        if "display_name" in data and isinstance(data.get("display_name"), str):
+            next_display_name = data.get("display_name", "").strip()[:64]
+            if next_display_name and next_display_name != current.get("display_name", ""):
+                current["display_name"] = next_display_name
+                delta["display_name"] = next_display_name
+                for session_info in self.sessions.values():
+                    if session_info["user_id"] == user_id:
+                        session_info["display_name"] = next_display_name
+                changed = True
+
+        if not changed:
+            return
+
+        self.presence[user_id] = current
+        self._persist_user_attachments(user_id)
+        self._broadcast(json.dumps(delta), exclude_session_id=sid)
+
+    async def on_webSocketClose(self, ws, _code, _reason, _was_clean):
+        session = self._session_for_ws(ws)
+        if not session:
+            return
+
+        sid, info = session
+        user_id = info["user_id"]
+        self.sessions.pop(sid, None)
+
+        still_connected = any(s["user_id"] == user_id for s in self.sessions.values())
+        if not still_connected:
+            self.presence.pop(user_id, None)
+            self._broadcast(json.dumps({"type": "leave", "user_id": user_id}))
+
+    async def on_webSocketError(self, _ws, error):
+        print(f"[PresenceDO.on_webSocketError] error={error!r}")
+
+    def _send_welcome(self, ws, session_id, user_id):
+        snapshot = {uid: dict(state) for uid, state in self.presence.items()}
+        try:
+            ws.send(json.dumps({
+                "type": "welcome",
+                "session_id": session_id,
+                "user_id": user_id,
+                "state": snapshot,
+            }))
+        except Exception as exc:
+            print(f"[PresenceDO._send_welcome] error={exc!r}")
+
+    def _session_for_ws(self, ws):
+        try:
+            raw = ws.deserializeAttachment()
+            if raw:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                session_id = data.get("session_id", "")
+                if session_id and session_id in self.sessions:
+                    return session_id, self.sessions[session_id]
+        except Exception as exc:
+            print(f"[PresenceDO._session_for_ws.deserialize] error={exc!r}")
+
+        for sid, info in self.sessions.items():
+            try:
+                if info["ws"] == ws:
+                    return sid, info
+            except Exception as exc:
+                print(f"[PresenceDO._session_for_ws.fallback] sid={sid} error={exc!r}")
+        return None
+
+    def _broadcast(self, payload, exclude_session_id=None):
+        for sid, info in self.sessions.items():
+            if sid == exclude_session_id:
+                continue
+            try:
+                info["ws"].send(payload)
+            except Exception as exc:
+                print(f"[PresenceDO._broadcast] sid={sid} user_id={info.get('user_id')} error={exc!r}")
+
+    def _persist_user_attachments(self, user_id):
+        state = self.presence.get(user_id)
+        if not state:
+            return
+        for sid, info in self.sessions.items():
+            if info["user_id"] != user_id:
+                continue
+            try:
+                info["ws"].serializeAttachment(json.dumps({
+                    "session_id": sid,
+                    "user_id": user_id,
+                    "display_name": info["display_name"],
+                    "x": state["x"],
+                    "y": state["y"],
+                    "emoji": state["emoji"],
+                    "hand_raised": state["hand_raised"],
+                }))
+            except Exception as exc:
+                print(f"[PresenceDO._persist_user_attachments] sid={sid} user_id={user_id} error={exc!r}")
+
+    @staticmethod
+    def _clamp_01(value):
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.5
+
 
 # ---------------------------------------------------------------------------
 # Main dispatcher
@@ -1239,13 +2037,35 @@ async def _dispatch(request, env):
             return _unauthorized_basic()
         return await serve_static("/admin.html", env)
 
+    m_classroom = re.fullmatch(r"/api/classroom/([A-Za-z0-9_-]+)", path)
+    if m_classroom:
+        room_id = m_classroom.group(1)
+        try:
+            do_id = env.CLASSROOM_DO.idFromName(room_id)
+            stub = env.CLASSROOM_DO.get(do_id)
+            return await stub.fetch(request)
+        except Exception as e:
+            await capture_exception(e, request, env, "classroom_do_dispatch")
+            return err("Failed to connect to classroom", 500)
+
+    m_presence = re.fullmatch(r"/api/presence/([A-Za-z0-9_-]+)", path)
+    if m_presence:
+        room_id = m_presence.group(1)
+        try:
+            do_id = env.PRESENCE_DO.idFromName(room_id)
+            stub = env.PRESENCE_DO.get(do_id)
+            return await stub.fetch(request)
+        except Exception as e:
+            await capture_exception(e, request, env, "presence_do_dispatch")
+            return err("Failed to connect to presence channel", 500)
+
     if path.startswith("/api/"):
         if path == "/api/init" and method == "POST":
             try:
                 await init_db(env)
                 return ok(None, "Database initialised")
             except Exception as e:
-                capture_exception(e, request, env, "api_init")
+                await capture_exception(e, request, env, "api_init")
                 return err("Database init failed — check D1 binding", 500)
 
         if path == "/api/seed" and method == "POST":
@@ -1254,7 +2074,7 @@ async def _dispatch(request, env):
                 await seed_db(env, env.ENCRYPTION_KEY)
                 return ok(None, "Sample data seeded")
             except Exception as e:
-                capture_exception(e, request, env, "api_seed")
+                await capture_exception(e, request, env, "api_seed")
                 return err("Seed failed — check D1 binding and schema", 500)
 
         if path == "/api/register" and method == "POST":
@@ -1291,6 +2111,23 @@ async def _dispatch(request, env):
         if path == "/api/admin/table-counts" and method == "GET":
             return await api_admin_table_counts(request, env)
 
+        if path.rstrip("/") == "/api/error" and method == "GET":
+            exc = RuntimeError("Sentry test error from /api/error")
+            await capture_exception(exc, request, env, "api_error_test")
+            return ok(None, "Test error sent to Sentry v2")
+
+
+        # Notifications
+        if path == "/api/notifications" and method == "GET":
+            return await api_list_notifications(request, env)
+        if path == "/api/notifications/unread-count" and method == "GET":
+            return await api_unread_count(request, env)
+        m_notif_read = re.fullmatch(r"/api/notifications/([A-Za-z0-9_-]+)/read", path)
+        if m_notif_read and method == "POST":
+            return await api_mark_notification_read(request, env, m_notif_read.group(1))
+        if path == "/api/notifications/read-all" and method == "POST":
+            return await api_mark_all_read(request, env)
+
         return err("API endpoint not found", 404)
 
     return await serve_static(path, env)
@@ -1298,7 +2135,134 @@ async def _dispatch(request, env):
 
 async def on_fetch(request, env):
     try:
+        init_sentry(env)
         return await _dispatch(request, env)
     except Exception as e:
-        capture_exception(e, request, env, "on_fetch_unhandled")
+        await capture_exception(e, request, env, "on_fetch_unhandled")
         return err("Internal server error", 500)
+
+
+# ---------------------------------------------------------------------------
+# Notifications API
+# ---------------------------------------------------------------------------
+
+async def _create_notification(env, user_id: str, type_: str, title: str,
+                                message: str, related_id: Optional[str] = None) -> None:
+    """Internal helper called by other handlers to create a notification.
+
+    Silently swallows errors so a notification failure never breaks the
+    parent operation (e.g. grading, peer requests, new assignments).
+    """
+    try:
+        enc = env.ENCRYPTION_KEY
+        await env.DB.prepare(
+            "INSERT INTO notifications (id, user_id, type, title, message, related_id)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+        ).bind(new_id(), user_id, type_,
+               encrypt(title, enc), encrypt(message, enc),
+               related_id).run()
+    except Exception as exc:
+        await capture_exception(exc, env=env, where="_create_notification")
+
+
+async def api_list_notifications(req, env):
+    """GET /api/notifications — list notifications for the authenticated user.
+
+    Query params:
+      - unread_only=true   return only unread notifications (default: false)
+      - limit=N            max results, default 20, max 50
+    """
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    if not user:
+        return err("Authentication required", 401)
+
+    url = req.url
+    unread_only = "unread_only=true" in url
+    try:
+        raw_limit = int(url.split("limit=")[1].split("&")[0]) if "limit=" in url else 20
+        limit = max(1, min(raw_limit, 50))
+    except (ValueError, IndexError):
+        limit = 20
+
+    if unread_only:
+        rows = await env.DB.prepare(
+            "SELECT id, type, title, message, is_read, related_id, created_at"
+            " FROM notifications"
+            " WHERE user_id = ? AND is_read = 0"
+            " ORDER BY created_at DESC LIMIT ?"
+        ).bind(user["id"], limit).all()
+    else:
+        rows = await env.DB.prepare(
+            "SELECT id, type, title, message, is_read, related_id, created_at"
+            " FROM notifications"
+            " WHERE user_id = ?"
+            " ORDER BY created_at DESC LIMIT ?"
+        ).bind(user["id"], limit).all()
+
+    notifications = [
+        {
+            "id":         r.id,
+            "type":       r.type,
+            "title":      decrypt(r.title or "", env.ENCRYPTION_KEY),
+            "message":    decrypt(r.message or "", env.ENCRYPTION_KEY),
+            "is_read":    bool(r.is_read),
+            "related_id": r.related_id,
+            "created_at": r.created_at,
+        }
+        for r in rows.results or []
+    ]
+
+    unread_count = await env.DB.prepare(
+        "SELECT COUNT(*) AS cnt FROM notifications WHERE user_id = ? AND is_read = 0"
+    ).bind(user["id"]).first()
+
+    return ok({
+        "notifications": notifications,
+        "unread_count":  unread_count.cnt if unread_count else 0,
+    })
+
+
+async def api_unread_count(req, env):
+    """GET /api/notifications/unread-count — return unread badge count only."""
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    if not user:
+        return err("Authentication required", 401)
+
+    row = await env.DB.prepare(
+        "SELECT COUNT(*) AS cnt FROM notifications WHERE user_id = ? AND is_read = 0"
+    ).bind(user["id"]).first()
+
+    return ok({"unread_count": row.cnt if row else 0})
+
+
+async def api_mark_notification_read(req, env, notification_id: str):
+    """POST /api/notifications/:id/read — mark a single notification as read."""
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    if not user:
+        return err("Authentication required", 401)
+
+    notif = await env.DB.prepare(
+        "SELECT id FROM notifications WHERE id = ? AND user_id = ?"
+    ).bind(notification_id, user["id"]).first()
+
+    if not notif:
+        return err("Notification not found", 404)
+
+    await env.DB.prepare(
+        "UPDATE notifications SET is_read = 1 WHERE id = ?"
+    ).bind(notification_id).run()
+
+    return ok(msg="Notification marked as read")
+
+
+async def api_mark_all_read(req, env):
+    """POST /api/notifications/read-all — mark all notifications as read."""
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    if not user:
+        return err("Authentication required", 401)
+
+    await env.DB.prepare(
+        "UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0"
+    ).bind(user["id"]).run()
+
+    return ok(msg="All notifications marked as read")
